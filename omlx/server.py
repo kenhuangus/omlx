@@ -1118,6 +1118,24 @@ async def list_models(_: bool = Depends(verify_api_key)) -> ModelsResponse:
     return ModelsResponse(data=models)
 
 
+@app.get("/v1/models/{model_id}")
+async def get_model(model_id: str, _: bool = Depends(verify_api_key)) -> ModelInfo:
+    """Retrieve a specific model by ID (OpenAI-compatible)."""
+    if _server_state.engine_pool is not None:
+        status = _server_state.engine_pool.get_status()
+        settings_manager = _server_state.settings_manager
+        for m in status["models"]:
+            mid = m["id"]
+            display_id = mid
+            if settings_manager:
+                ms = settings_manager.get_settings(mid)
+                if ms.model_alias:
+                    display_id = ms.model_alias
+            if display_id == model_id or mid == model_id:
+                return ModelInfo(id=display_id, owned_by="omlx")
+    raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
+
+
 @app.get("/v1/models/status")
 async def list_models_status(_: bool = Depends(verify_api_key)):
     """
@@ -1794,6 +1812,7 @@ async def stream_chat_completion(
     first_token_time = None
     last_output = None
     accumulated_text = ""
+    content_emitted = False
     has_tools = bool(kwargs.get("tools"))
     thinking_parser = ThinkingParser()
 
@@ -1809,19 +1828,16 @@ async def stream_chat_completion(
     )
     yield f"data: {first_chunk.model_dump_json(exclude_none=True)}\n\n"
 
-    # Stream content token-by-token.  When tools are present and the
-    # tokenizer has a known tool-call start marker, a ToolCallStreamFilter
-    # suppresses tool-call markup so clients don't see raw XML/tags.
-    # When no marker is available (fallback parser models), buffer all
-    # content and emit it after generation to ensure markup is cleaned.
+    # When tools are present, always buffer content and emit after generation.
+    # This guarantees clean separation: either content OR tool_calls are
+    # emitted, never interleaved. It also prevents reasoning_content-only
+    # responses that clients like Cline interpret as empty messages.
     tool_filter = None
-    stream_content = True
+    stream_content = not has_tools
     if has_tools:
         _f = ToolCallStreamFilter(engine.tokenizer)
         if _f.active:
             tool_filter = _f
-        else:
-            stream_content = False
     try:
         async for output in engine.stream_chat(messages=messages, **kwargs):
             if first_token_time is None and output.new_text:
@@ -1847,10 +1863,12 @@ async def stream_chat_completion(
 
                 # Emit content delta — filter out tool-call markup when
                 # tools are present so clients see clean streamed text.
+                # Also suppress whitespace-only deltas when tools are present
+                # to avoid sending content before tool_calls in the final chunk.
                 if content_delta:
                     if tool_filter:
                         content_delta = tool_filter.feed(content_delta)
-                    if content_delta:
+                    if content_delta and (not has_tools or content_delta.strip()):
                         chunk = ChatCompletionChunk(
                             id=response_id,
                             model=request.model,
@@ -1860,6 +1878,7 @@ async def stream_chat_completion(
                             )],
                         )
                         yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                        content_emitted = True
     except Exception as e:
         logger.error(f"Error during chat streaming: {e}")
         error_chunk = ChatCompletionChunk(
@@ -1890,7 +1909,7 @@ async def stream_chat_completion(
         if content_delta:
             if tool_filter:
                 content_delta = tool_filter.feed(content_delta)
-            if content_delta:
+            if content_delta and (not has_tools or content_delta.strip()):
                 chunk = ChatCompletionChunk(
                     id=response_id,
                     model=request.model,
@@ -1909,6 +1928,28 @@ async def stream_chat_completion(
                     model=request.model,
                     choices=[ChatCompletionChunkChoice(
                         delta=ChatCompletionChunkDelta(content=remaining),
+                        finish_reason=None,
+                    )],
+                )
+                yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                content_emitted = True
+
+        # Fallback: if the model placed its entire response inside <think> tags
+        # (or scheduler-prepended <think> was never closed), content_emitted
+        # will be False. Extract real text and emit as content so clients like
+        # Cline never receive a blank message.
+        if not content_emitted and not has_tools and accumulated_text:
+            import re as _re
+            thinking_text, regular_text = extract_thinking(accumulated_text)
+            # Pick best candidate and strip any remaining <think> tags
+            raw_fallback = regular_text.strip() or thinking_text.strip() or accumulated_text
+            fallback = _re.sub(r'</?think>\n?', '', raw_fallback).strip()
+            if fallback:
+                chunk = ChatCompletionChunk(
+                    id=response_id,
+                    model=request.model,
+                    choices=[ChatCompletionChunkChoice(
+                        delta=ChatCompletionChunkDelta(content=fallback),
                         finish_reason=None,
                     )],
                 )
@@ -1941,7 +1982,7 @@ async def stream_chat_completion(
             tools=kwargs.get("tools"),
         )
 
-        # Buffered mode: emit thinking and cleaned content now
+        # Buffered mode: emit thinking then content (or tool calls, not both)
         if not stream_content:
             if thinking_content:
                 chunk = ChatCompletionChunk(
@@ -1953,16 +1994,24 @@ async def stream_chat_completion(
                     )],
                 )
                 yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
-            if cleaned_text:
-                chunk = ChatCompletionChunk(
-                    id=response_id,
-                    model=request.model,
-                    choices=[ChatCompletionChunkChoice(
-                        delta=ChatCompletionChunkDelta(content=cleaned_text),
-                        finish_reason=None,
-                    )],
-                )
-                yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+            # Only emit content if there are no tool calls (never mix both)
+            if not tool_calls:
+                emit_text = cleaned_text.strip() if cleaned_text else ""
+                # Fallback: if model only produced thinking with no content/tool calls,
+                # emit thinking as content so clients that ignore reasoning_content
+                # (e.g. Cline) still get a non-empty response instead of an error.
+                if not emit_text and thinking_content:
+                    emit_text = thinking_content.strip()
+                if emit_text:
+                    chunk = ChatCompletionChunk(
+                        id=response_id,
+                        model=request.model,
+                        choices=[ChatCompletionChunkChoice(
+                            delta=ChatCompletionChunkDelta(content=emit_text),
+                            finish_reason=None,
+                        )],
+                    )
+                    yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
 
     # Emit tool call chunks if found
     if tool_calls:
